@@ -8,18 +8,18 @@
       this.project = "my-game";
       this.token = "";
       this.userId = "";
-      this.state = "disconnected";
+      this.connectionStatus = "disconnected";
       this.error = "";
       this.ok = false;
       this.cache = {};
       this.data = "";
       this.pending = 0;
       this.board = {};
-      this.room = "";
+      this.currentRoom = "";
       this.ws = null;
       this.events = [];
       this.eventData = "";
-      this.eventPlayer = "";
+      this.lastEventPlayer = "";
     }
     getInfo() {
       return {
@@ -87,10 +87,10 @@
       } catch(e) { this.ok=false; this.error=e.message||String(e); throw e; }
       finally { this.pending=Math.max(0,this.pending-1); }
     }
-    async connect(a) { try { this.api=this.str(a.URL).trim().replace(/\/+$/,""); this.project=this.str(a.PROJECT).trim()||"my-game"; await this.req("/v1/health"); this.state="connected"; } catch(e) { this.state="error"; } }
-    disconnect() { this.leaveRoom(); this.token=""; this.userId=""; this.state="disconnected"; }
-    state() { return this.state; }
-    isConnected() { return this.state==="connected"; }
+    async connect(a) { try { this.api=this.str(a.URL).trim().replace(/\/+$/,""); this.project=this.str(a.PROJECT).trim()||"my-game"; await this.req("/v1/health"); this.connectionStatus="connected"; } catch(e) { this.connectionStatus="error"; } }
+    disconnect() { this.leaveRoom(); this.token=""; this.userId=""; this.connectionStatus="disconnected"; }
+    state() { return this.connectionStatus; }
+    isConnected() { return this.connectionStatus==="connected"; }
     lastError() { return this.error; }
     lastOK() { return this.ok; }
     pendingCount() { return this.pending; }
@@ -122,17 +122,17 @@
       try {
         await this.req("/v1/projects/"+this.enc(this.project)+"/rooms/"+this.enc(room)+(create?"/create":"/join"),"POST",{});
         const u=new URL(this.api);u.protocol=u.protocol==="https:"?"wss:":"ws:";u.pathname="/v1/ws";u.search="?project="+this.enc(this.project)+"&token="+this.enc(this.token);
-        this.ws=new WebSocket(u); this.room=room;
+        this.ws=new WebSocket(u); this.currentRoom=room;
         this.ws.onopen=()=>{this.ws.send(JSON.stringify({type:"join",room}));};
-        this.ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==="event"){this.events.push({event:m.event,data:typeof m.data==="string"?m.data:JSON.stringify(m.data),player:m.playerId||""});this.eventData=this.events[this.events.length-1].data;this.eventPlayer=m.playerId||"";if(this.events.length>100)this.events.shift();}}catch(_){}};
+        this.ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==="event"){this.events.push({event:m.event,data:typeof m.data==="string"?m.data:JSON.stringify(m.data),player:m.playerId||""});this.eventData=this.events[this.events.length-1].data;this.lastEventPlayer=m.playerId||"";if(this.events.length>100)this.events.shift();}}catch(_){}};
       } catch(e) {}
     }
-    leaveRoom() { if(this.ws)try{this.ws.close();}catch(e){} this.ws=null;this.room=""; }
-    room() { return this.room; }
+    leaveRoom() { if(this.ws)try{this.ws.close();}catch(e){} this.ws=null;this.currentRoom=""; }
+    room() { return this.currentRoom; }
     sendEvent(a) { if(this.ws&&this.ws.readyState===1)this.ws.send(JSON.stringify({type:"event",event:this.str(a.EVENT),data:this.str(a.DATA)}));else{this.ok=false;this.error="Not connected to a room";} }
     eventHat(a) { const i=this.events.findIndex(x=>x.event===this.str(a.EVENT));if(i<0)return false;this.events.splice(i,1);return true; }
     eventPayload() { return this.eventData; }
-    eventPlayer() { return this.eventPlayer; }
+    eventPlayer() { return this.lastEventPlayer; }
     wsState() { return this.ws?({0:"connecting",1:"connected",2:"closing",3:"disconnected"}[this.ws.readyState]||"unknown"):"disconnected"; }
     jsonValid(a) { try {JSON.parse(this.str(a.TEXT));return true;}catch(e){return false;} }
     jsonPretty(a) { try{return JSON.stringify(JSON.parse(this.str(a.TEXT)),null,2);}catch(e){return "";} }
