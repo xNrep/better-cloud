@@ -56,7 +56,7 @@ function safeEqual(a, b) {
 function cleanName(value, field = "name", max = 64) {
   if (typeof value !== "string") throw httpError(400, "INVALID_INPUT", `${field} must be text.`);
   const out = value.trim();
-  if (!out || out.length > max || /[\\u0000-\\u001f]/.test(out)) throw httpError(400, "INVALID_INPUT", `${field} is invalid.`);
+  if (!out || out.length > max || /[\u0000-\u001f]/.test(out)) throw httpError(400, "INVALID_INPUT", `${field} is invalid.`);
   return out;
 }
 function httpError(status, code, message) {
@@ -219,7 +219,162 @@ app.post("/v1/projects/:project/cloud/:key/increment", async (req, res, next) =>
     const r = await pool.query(`
       INSERT INTO cloud_values(project_id,key,value,revision) VALUES($1,$2,$3,1)
       ON CONFLICT(project_id,key) DO UPDATE SET
-        value=(CASE WHEN cloud_values.value ~ '^-?[0-9]+(\\\\.[0-9]+)?$' THEN cloud_values.value::double precision ELSE 0 END + $3)::text,
+        value=(CASE WHEN cloud_values.value ~ '^-?[0-9]+([.][0-9]+)? THEN cloud_values.value::double precision ELSE 0 END + $3)::text,
+        revision=cloud_values.revision+1, updated_at=NOW()
+      RETURNING value, revision, updated_at`, [project, key, amount]);
+    res.json({ key, value: r.rows[0].value, revision: Number(r.rows[0].revision), updatedAt: r.rows[0].updated_at });
+  } catch (e) { next(e); }
+});
+
+app.put("/v1/projects/:project/saves/:slot", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), slot = slotParam(req);
+    let data = req.body.data;
+    if (typeof data === "string") { try { data = JSON.parse(data); } catch (_) { throw httpError(400, "INVALID_JSON", "Save data must be valid JSON."); } }
+    const serialized = JSON.stringify(data);
+    if (serialized.length > 65536) throw httpError(413, "SAVE_TOO_LARGE", "Save data exceeds 64 KB.");
+    const r = await pool.query(`
+      INSERT INTO saves(project_id,user_id,slot,data) VALUES($1,$2,$3,$4::jsonb)
+      ON CONFLICT(project_id,user_id,slot) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+      RETURNING updated_at`, [project, req.user.sub, slot, serialized]);
+    res.json({ ok: true, updatedAt: r.rows[0].updated_at });
+  } catch (e) { next(e); }
+});
+app.get("/v1/projects/:project/saves/:slot", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), slot = slotParam(req);
+    const r = await pool.query("SELECT data, updated_at FROM saves WHERE project_id=$1 AND user_id=$2 AND slot=$3", [project, req.user.sub, slot]);
+    if (!r.rowCount) throw httpError(404, "NOT_FOUND", "Save slot does not exist.");
+    res.json({ data: JSON.stringify(r.rows[0].data), updatedAt: r.rows[0].updated_at });
+  } catch (e) { next(e); }
+});
+app.delete("/v1/projects/:project/saves/:slot", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), slot = slotParam(req);
+    const r = await pool.query("DELETE FROM saves WHERE project_id=$1 AND user_id=$2 AND slot=$3", [project, req.user.sub, slot]);
+    if (!r.rowCount) throw httpError(404, "NOT_FOUND", "Save slot does not exist.");
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+app.post("/v1/projects/:project/leaderboards/:name/scores", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), name = boardParam(req), score = Number(req.body.score);
+    if (!Number.isFinite(score) || Math.abs(score) > 1e15) throw httpError(400, "INVALID_SCORE", "Score must be a finite number within range.");
+    await pool.query("INSERT INTO scores(project_id,leaderboard,user_id,score) VALUES($1,$2,$3,$4)", [project, name, req.user.sub, score]);
+    res.status(201).json({ ok: true });
+  } catch (e) { next(e); }
+});
+app.get("/v1/projects/:project/leaderboards/:name", async (req, res, next) => {
+  try {
+    const project = projectParam(req), name = boardParam(req);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+    const r = await pool.query(`
+      SELECT DISTINCT ON (s.user_id) s.user_id, u.username, s.score, s.created_at
+      FROM scores s JOIN users u ON u.id=s.user_id
+      WHERE s.project_id=$1 AND s.leaderboard=$2
+      ORDER BY s.user_id, s.score DESC, s.created_at ASC`, [project, name]);
+    const entries = r.rows.sort((a,b) => Number(b.score) - Number(a.score)).slice(0, limit).map((row, i) => ({
+      rank: i + 1, userId: row.user_id, username: row.username, score: Number(row.score), createdAt: row.created_at
+    }));
+    res.json({ entries });
+  } catch (e) { next(e); }
+});
+
+app.post("/v1/projects/:project/rooms/:room/create", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), room = cleanName(req.params.room, "room", 64);
+    await pool.query("INSERT INTO rooms(project_id,room_id,created_by) VALUES($1,$2,$3) ON CONFLICT(project_id,room_id) DO NOTHING", [project, room, req.user.sub]);
+    res.status(201).json({ room });
+  } catch (e) { next(e); }
+});
+app.post("/v1/projects/:project/rooms/:room/join", requireAuth, async (req, res, next) => {
+  try {
+    const project = projectParam(req), room = cleanName(req.params.room, "room", 64);
+    const r = await pool.query("SELECT room_id FROM rooms WHERE project_id=$1 AND room_id=$2", [project, room]);
+    if (!r.rowCount) throw httpError(404, "ROOM_NOT_FOUND", "Room does not exist. Create it first.");
+    res.json({ room });
+  } catch (e) { next(e); }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url, "http://localhost");
+    if (url.pathname !== "/v1/ws") return socket.destroy();
+    const project = cleanName(url.searchParams.get("project") || "", "project", 100);
+    const token = url.searchParams.get("token") || "";
+    const user = jwt.verify(token, JWT_SECRET);
+    wss.handleUpgrade(req, socket, head, ws => {
+      ws.meta = { project, userId: user.sub, username: user.username, room: "" };
+      wss.emit("connection", ws, req);
+    });
+  } catch (_) { socket.destroy(); }
+});
+function send(ws, obj) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+function roomKey(project, room) { return `${project}::${room}`; }
+wss.on("connection", ws => {
+  ws.on("message", async raw => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (_) { return send(ws, { type: "error", code: "INVALID_JSON" }); }
+    if (msg.type === "join") {
+      let room;
+      try { room = cleanName(msg.room, "room", 64); } catch (e) { return send(ws, { type: "error", code: e.code }); }
+      const exists = await pool.query("SELECT 1 FROM rooms WHERE project_id=$1 AND room_id=$2", [ws.meta.project, room]).catch(() => ({ rowCount: 0 }));
+      if (!exists.rowCount) return send(ws, { type: "error", code: "ROOM_NOT_FOUND" });
+      if (ws.meta.room) removeFromRoom(ws);
+      ws.meta.room = room;
+      const key = roomKey(ws.meta.project, room);
+      if (!rooms.has(key)) rooms.set(key, new Set());
+      rooms.get(key).add(ws);
+      send(ws, { type: "joined", room, playerId: ws.meta.userId });
+      broadcast(key, { type: "event", event: "player-joined", data: { userId: ws.meta.userId, username: ws.meta.username }, playerId: ws.meta.userId }, ws);
+    } else if (msg.type === "event") {
+      if (!ws.meta.room) return send(ws, { type: "error", code: "NOT_IN_ROOM" });
+      const event = cleanName(String(msg.event || ""), "event", 64);
+      const data = typeof msg.data === "string" ? msg.data : JSON.stringify(msg.data ?? null);
+      if (data.length > 8192) return send(ws, { type: "error", code: "EVENT_TOO_LARGE" });
+      broadcast(roomKey(ws.meta.project, ws.meta.room), { type: "event", event, data, playerId: ws.meta.userId }, ws);
+    }
+  });
+  ws.on("close", () => {
+    if (ws.meta && ws.meta.room) {
+      const key = roomKey(ws.meta.project, ws.meta.room);
+      broadcast(key, { type: "event", event: "player-left", data: { userId: ws.meta.userId }, playerId: ws.meta.userId }, ws);
+      removeFromRoom(ws);
+    }
+  });
+});
+function broadcast(key, msg, except) {
+  const group = rooms.get(key);
+  if (!group) return;
+  for (const client of group) if (client !== except) send(client, msg);
+}
+function removeFromRoom(ws) {
+  const key = roomKey(ws.meta.project, ws.meta.room);
+  const group = rooms.get(key);
+  if (group) { group.delete(ws); if (!group.size) rooms.delete(key); }
+  ws.meta.room = "";
+}
+
+app.use((req, res, next) => next(httpError(404, "ROUTE_NOT_FOUND", "Route not found.")));
+app.use((err, _req, res, _next) => {
+  const status = Number(err.status) || (err.code === "23505" ? 409 : 500);
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: status >= 500 ? "Internal server error." : err.message, code: err.code || "INTERNAL_ERROR" });
+});
+
+initDb().then(() => {
+  server.listen(PORT, "0.0.0.0", () => console.log(`Better Cloud Data API listening on ${PORT}`));
+}).catch(err => {
+  console.error("Database initialization failed:", err);
+  process.exit(1);
+});
+
+process.on("SIGTERM", async () => {
+  server.close();
+  try { await pool.end(); } finally { process.exit(0); }
+});
+ THEN cloud_values.value::double precision ELSE 0 END + $3)::text,
         revision=cloud_values.revision+1, updated_at=NOW()
       RETURNING value, revision, updated_at`, [project, key, amount]);
     res.json({ key, value: r.rows[0].value, revision: Number(r.rows[0].revision), updatedAt: r.rows[0].updated_at });
